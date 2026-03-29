@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Interactive boilerplate configurator for auth/API/tenancy features.
+
+This script generates:
+- requirements/features.txt
+- config/settings/features.py
+- config/template_profile.json
+
+It is idempotent and safe to rerun.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+AUTH_CHOICES = ["session", "jwt", "oauth2", "jwt_oauth2", "token"]
+TENANCY_CHOICES = ["none", "schema"]
+
+
+@dataclass
+class Selection:
+    api: bool
+    auth: str
+    docs: bool
+    social_auth: bool
+    mfa: bool
+    tenancy: str
+
+
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"y", "yes", "true", "1"}:
+        return True
+    if normalized in {"n", "no", "false", "0"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
+def prompt_yes_no(question: str, default: bool) -> bool:
+    default_text = "Y/n" if default else "y/N"
+    raw = input(f"{question} [{default_text}]: ").strip()
+    if not raw:
+        return default
+    return parse_bool(raw)
+
+
+def prompt_choice(question: str, choices: list[str], default: str) -> str:
+    values = "/".join(choices)
+    raw = input(f"{question} ({values}) [{default}]: ").strip().lower()
+    if not raw:
+        return default
+    if raw not in choices:
+        raise ValueError(f"Invalid choice '{raw}', expected one of: {values}")
+    return raw
+
+
+def gather_selection(args: argparse.Namespace) -> Selection:
+    interactive = args.interactive
+
+    if interactive:
+        api = prompt_yes_no("Enable API stack (DRF + filters)?", True)
+        auth = prompt_choice("Authentication mode", AUTH_CHOICES, "jwt")
+        docs = prompt_yes_no("Enable OpenAPI docs (drf-spectacular)?", True)
+        social_auth = prompt_yes_no("Enable django-allauth scaffold?", False)
+        mfa = prompt_yes_no("Enable MFA helpers (pyotp/qrcode)?", True)
+        tenancy = prompt_choice("Tenancy mode", TENANCY_CHOICES, "none")
+        return Selection(
+            api=api,
+            auth=auth,
+            docs=docs,
+            social_auth=social_auth,
+            mfa=mfa,
+            tenancy=tenancy,
+        )
+
+    return Selection(
+        api=parse_bool(args.api),
+        auth=args.auth,
+        docs=parse_bool(args.docs),
+        social_auth=parse_bool(args.social_auth),
+        mfa=parse_bool(args.mfa),
+        tenancy=args.tenancy,
+    )
+
+
+def resolve_dependencies(selection: Selection) -> list[str]:
+    deps: list[str] = []
+
+    if selection.api:
+        deps.extend([
+            "djangorestframework>=3.15",
+            "django-filter>=24.0",
+        ])
+
+    if selection.docs:
+        deps.append("drf-spectacular>=0.27")
+
+    if selection.auth in {"jwt", "jwt_oauth2"}:
+        deps.append("djangorestframework-simplejwt>=5.3")
+
+    if selection.auth in {"oauth2", "jwt_oauth2"}:
+        deps.append("django-oauth-toolkit>=3.0")
+
+    if selection.auth == "token":
+        deps.append("djangorestframework>=3.15")
+
+    if selection.social_auth:
+        deps.append("django-allauth>=0.57")
+
+    if selection.mfa:
+        deps.extend([
+            "pyotp>=2.9",
+            "qrcode>=7.1,<8.0",
+        ])
+
+    if selection.tenancy == "schema":
+        deps.append("django-tenants>=3.7")
+
+    # preserve order while deduplicating
+    unique: list[str] = []
+    seen: set[str] = set()
+    for dep in deps:
+        if dep not in seen:
+            seen.add(dep)
+            unique.append(dep)
+    return unique
+
+
+def render_features_py(selection: Selection) -> str:
+    api_enabled = "True" if selection.api else "False"
+    docs_enabled = "True" if selection.docs else "False"
+    social_enabled = "True" if selection.social_auth else "False"
+    mfa_enabled = "True" if selection.mfa else "False"
+
+    auth_classes: list[str] = []
+    if selection.auth == "jwt":
+        auth_classes = ["rest_framework_simplejwt.authentication.JWTAuthentication"]
+    elif selection.auth == "oauth2":
+        auth_classes = ["oauth2_provider.contrib.rest_framework.OAuth2Authentication"]
+    elif selection.auth == "jwt_oauth2":
+        auth_classes = [
+            "rest_framework_simplejwt.authentication.JWTAuthentication",
+            "oauth2_provider.contrib.rest_framework.OAuth2Authentication",
+        ]
+    elif selection.auth == "token":
+        auth_classes = ["rest_framework.authentication.TokenAuthentication"]
+
+    auth_classes_block = "[\n"
+    for klass in auth_classes:
+        auth_classes_block += f"    \"{klass}\",\n"
+    auth_classes_block += "]"
+
+    tenancy_block = ""
+    if selection.tenancy == "schema":
+        tenancy_block = """
+# Schema-per-tenant scaffold (django-tenants)
+if _module_available("django_tenants"):
+    _append_unique(THIRD_PARTY_APPS, "django_tenants")
+    TENANCY_ENABLED = True
+    TENANT_MODEL = "tenants.Client"
+    TENANT_DOMAIN_MODEL = "tenants.Domain"
+    DATABASE_ROUTERS = ("django_tenants.routers.TenantSyncRouter",)
+"""
+
+    return f'''"""Generated by scripts/configure_boilerplate.py - do not hand-edit."""
+
+import importlib.util
+
+FEATURE_FLAGS = {{
+    "api": {api_enabled},
+    "auth": "{selection.auth}",
+    "docs": {docs_enabled},
+    "social_auth": {social_enabled},
+    "mfa": {mfa_enabled},
+    "tenancy": "{selection.tenancy}",
+}}
+
+
+def _append_unique(target: list[str], value: str) -> None:
+    if value not in target:
+        target.append(value)
+
+
+def _module_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+if FEATURE_FLAGS["api"]:
+    _append_unique(THIRD_PARTY_APPS, "rest_framework")
+    _append_unique(THIRD_PARTY_APPS, "django_filters")
+
+if FEATURE_FLAGS["docs"]:
+    _append_unique(THIRD_PARTY_APPS, "drf_spectacular")
+
+if FEATURE_FLAGS["auth"] in {{"oauth2", "jwt_oauth2"}} and _module_available("oauth2_provider"):
+    _append_unique(THIRD_PARTY_APPS, "oauth2_provider")
+
+if FEATURE_FLAGS["auth"] == "token":
+    _append_unique(THIRD_PARTY_APPS, "rest_framework.authtoken")
+
+if FEATURE_FLAGS["social_auth"] and _module_available("allauth"):
+    _append_unique(THIRD_PARTY_APPS, "allauth")
+    _append_unique(THIRD_PARTY_APPS, "allauth.account")
+    _append_unique(MIDDLEWARE, "allauth.account.middleware.AccountMiddleware")
+    ACCOUNT_LOGIN_METHODS = {{"email"}}
+    ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*", "password2*"]
+    ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+    ACCOUNT_ADAPTER = "allauth.account.adapter.DefaultAccountAdapter"
+
+if FEATURE_FLAGS["api"]:
+    REST_FRAMEWORK = globals().get("REST_FRAMEWORK", {{}})
+    REST_FRAMEWORK.setdefault(
+        "DEFAULT_PERMISSION_CLASSES",
+        ["rest_framework.permissions.IsAuthenticated"],
+    )
+    REST_FRAMEWORK.setdefault(
+        "DEFAULT_FILTER_BACKENDS",
+        [
+            "django_filters.rest_framework.DjangoFilterBackend",
+            "rest_framework.filters.SearchFilter",
+            "rest_framework.filters.OrderingFilter",
+        ],
+    )
+
+if FEATURE_FLAGS["api"] and {auth_classes_block}:
+    REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"] = {auth_classes_block}
+
+if FEATURE_FLAGS["docs"]:
+    REST_FRAMEWORK["DEFAULT_SCHEMA_CLASS"] = "drf_spectacular.openapi.AutoSchema"
+    SPECTACULAR_SETTINGS = globals().get("SPECTACULAR_SETTINGS", {{
+        "TITLE": "API",
+        "DESCRIPTION": "Generated API schema",
+        "VERSION": "1.0.0",
+    }})
+
+if FEATURE_FLAGS["mfa"]:
+    MFA_REQUIRED_BY_DEFAULT = True
+    MFA_TOTP_WINDOW = 1
+
+if FEATURE_FLAGS["auth"] in {{"oauth2", "jwt_oauth2"}} and _module_available("oauth2_provider"):
+    AUTHENTICATION_BACKENDS = [
+        "django.contrib.auth.backends.ModelBackend",
+        "oauth2_provider.backends.OAuth2Backend",
+    ]
+
+{tenancy_block}
+INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
+'''
+
+
+def write_outputs(root: Path, selection: Selection) -> None:
+    deps = resolve_dependencies(selection)
+
+    req_file = root / "requirements" / "features.txt"
+    settings_file = root / "config" / "settings" / "features.py"
+    profile_file = root / "config" / "template_profile.json"
+
+    req_content = "# Generated by scripts/configure_boilerplate.py\n"
+    if deps:
+        req_content += "\n".join(deps) + "\n"
+    req_file.write_text(req_content)
+
+    settings_file.write_text(render_features_py(selection))
+    profile_file.write_text(json.dumps(asdict(selection), indent=2) + "\n")
+
+    print("\nConfiguration saved:")
+    print(f"- {req_file}")
+    print(f"- {settings_file}")
+    print(f"- {profile_file}")
+
+    print("\nNext steps:")
+    print("1. Install dependencies: uv pip install -r requirements/local.txt")
+    print("2. Run checks: python manage.py check")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Configure template feature flags")
+
+    parser.add_argument("--interactive", action="store_true", default=True)
+    parser.add_argument("--non-interactive", dest="interactive", action="store_false")
+
+    parser.add_argument("--api", default="yes", help="yes/no")
+    parser.add_argument("--auth", default="jwt", choices=AUTH_CHOICES)
+    parser.add_argument("--docs", default="yes", help="yes/no")
+    parser.add_argument("--social-auth", default="no", help="yes/no")
+    parser.add_argument("--mfa", default="yes", help="yes/no")
+    parser.add_argument("--tenancy", default="none", choices=TENANCY_CHOICES)
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    root = Path(__file__).resolve().parent.parent
+    selection = gather_selection(args)
+    write_outputs(root, selection)
+
+
+if __name__ == "__main__":
+    main()

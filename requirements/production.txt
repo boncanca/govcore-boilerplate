@@ -1,0 +1,6 @@
+-r base.txt
+-r features.txt
+gunicorn>=23.0
+whitenoise>=6.8
+sentry-sdk[django]>=2.0
+django-storages[s3]>=1.14
